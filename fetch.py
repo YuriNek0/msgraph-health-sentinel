@@ -15,7 +15,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple
+from typing import Protocol, Tuple
 
 import requests
 
@@ -26,6 +26,8 @@ DEFAULT_CONFIG = Path(__file__).with_name("config.json")
 TOKEN_URL = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
 SEND_MAIL_ENDPOINT = "https://graph.microsoft.com/v1.0/me/sendMail"
 SUCCESS_CODES: Tuple[int, ...] = (200, 201, 204, 304)
+RETRYABLE_STATUS_CODES: Tuple[int, ...] = (429, 500, 501, 502, 503, 504)
+RETRY_DELAY_SECONDS: Tuple[int, int] = (3, 10)
 EMAIL_RATE_LIMIT_MINUTES = 720
 REQUEST_ERROR_RESPONSE_MAX_CHARS = 1000
 
@@ -153,8 +155,57 @@ class PollResult:
         )
 
 
+class GraphRequester(Protocol):
+    def request(self, endpoint: GraphEndpoint) -> requests.Response: ...
+
+
+@dataclass(frozen=True)
+class DeferredRetry:
+    endpoint: GraphEndpoint
+    result_index: int
+
+
 def _scope_is_covered(endpoint: GraphEndpoint, granted_scopes: set[str]) -> bool:
     return set(endpoint.required_permissions).issubset(granted_scopes)
+
+
+def _should_retry_endpoint_error(is_in_scope: bool, exc: RequestError) -> bool:
+    return is_in_scope and exc.status_code in RETRYABLE_STATUS_CODES
+
+
+def _endpoint_result_from_response(
+    endpoint: GraphEndpoint,
+    response: requests.Response,
+    count_in_alerts: bool,
+) -> EndpointResult:
+    return EndpointResult(
+        endpoint=endpoint,
+        ok=True,
+        status_code=response.status_code,
+        count_in_alerts=count_in_alerts,
+    )
+
+
+def _endpoint_result_from_error(
+    endpoint: GraphEndpoint,
+    exc: RequestError,
+    count_in_alerts: bool,
+) -> EndpointResult:
+    return EndpointResult(
+        endpoint=endpoint,
+        ok=False,
+        status_code=exc.status_code,
+        error=exc.message,
+        response_text=exc.response_text,
+        request_id=exc.request_id,
+        count_in_alerts=count_in_alerts,
+    )
+
+
+def _log_request_error(endpoint: GraphEndpoint, exc: RequestError, label: str) -> None:
+    print(f"[{label}] {endpoint.name} -> {exc}")
+    if exc.response_text:
+        print(f"[{label}-response] {exc.endpoint} -> {exc.response_text}")
 
 
 def _build_missing_scope_report(granted_scopes: set[str]) -> dict[str, tuple[str, ...]]:
@@ -437,13 +488,14 @@ class GraphClient:
 
 
 def poll_graph_endpoints(
-    client: GraphClient, config_scopes: tuple[str, ...]
+    client: GraphRequester, config_scopes: tuple[str, ...]
 ) -> PollResult:
     endpoints = list(ENDPOINTS)
     random.shuffle(endpoints)
     scope_set = set(config_scopes)
 
-    results: list[EndpointResult] = []
+    results: list[EndpointResult | None] = []
+    deferred_retries: list[DeferredRetry] = []
     for endpoint in endpoints:
         should_count = _scope_is_covered(endpoint, scope_set)
         try:
@@ -451,35 +503,45 @@ def poll_graph_endpoints(
             status_label = "ok" if should_count else "warn"
             print(f"[{status_label}] {endpoint.name} -> {response.status_code}")
             results.append(
-                EndpointResult(
-                    endpoint=endpoint,
-                    ok=True,
-                    status_code=response.status_code,
-                    count_in_alerts=should_count,
-                )
+                _endpoint_result_from_response(endpoint, response, should_count)
             )
         except RequestError as exc:
+            if _should_retry_endpoint_error(should_count, exc):
+                print(
+                    f"[retry-pending] {endpoint.name} -> {exc}. "
+                    "Will retry after initial endpoint pass."
+                )
+                results.append(None)
+                deferred_retries.append(
+                    DeferredRetry(endpoint=endpoint, result_index=len(results) - 1)
+                )
+                continue
+
             label = "warn" if not should_count else "error"
-            print(f"[{label}] {endpoint.name} -> {exc}")
-            if exc.response_text:
-                response_label = (
-                    "warn-response" if not should_count else "error-response"
-                )
-                print(f"[{response_label}] {exc.endpoint} -> {exc.response_text}")
-            status = exc.status_code
-            results.append(
-                EndpointResult(
-                    endpoint=endpoint,
-                    ok=False,
-                    status_code=status,
-                    error=exc.message,
-                    response_text=exc.response_text,
-                    request_id=exc.request_id,
-                    count_in_alerts=should_count,
-                )
+            _log_request_error(endpoint, exc, label)
+            results.append(_endpoint_result_from_error(endpoint, exc, should_count))
+
+    for retry in deferred_retries:
+        delay = random.randint(*RETRY_DELAY_SECONDS)
+        print(f"[retry-delay] {retry.endpoint.name} -> sleeping {delay} seconds")
+        time.sleep(delay)
+        try:
+            response = client.request(retry.endpoint)
+            print(f"[retry-ok] {retry.endpoint.name} -> {response.status_code}")
+            results[retry.result_index] = _endpoint_result_from_response(
+                retry.endpoint,
+                response,
+                count_in_alerts=True,
+            )
+        except RequestError as exc:
+            _log_request_error(retry.endpoint, exc, "error")
+            results[retry.result_index] = _endpoint_result_from_error(
+                retry.endpoint,
+                exc,
+                count_in_alerts=True,
             )
 
-    return PollResult(tuple(results))
+    return PollResult(tuple(item for item in results if item is not None))
 
 
 def should_send_alert(

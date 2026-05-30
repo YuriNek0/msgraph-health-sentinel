@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "libraries": {
+    "microsoft-graph": [
+      {
+        "topic": "throttling and retry guidance",
+        "path": ".tmp/external-context/microsoft-graph/throttling-retry-guidance.md",
+        "source": "Official Microsoft Learn",
+        "official_docs": "https://learn.microsoft.com/en-us/graph/throttling",
+        "fetched": "2026-05-29T00:00:00Z"
+      }
+    ]
+  }
+}
